@@ -300,6 +300,31 @@ def compute_retry_sleep(response, attempt, backoff_base, backoff_max):
     return min(backoff_max, delay)
 
 
+def _is_proxy_connection_error(exc):
+    if isinstance(exc, requests.exceptions.ProxyError):
+        return True
+    text = safe_str(exc).lower()
+    return "proxy" in text and ("refused" in text or "unable to connect" in text)
+
+
+def _post_openrouter(payload, headers, trust_env=True):
+    if trust_env:
+        return requests.post(
+            "https://openrouter.ai/api/v1/chat/completions",
+            headers=headers,
+            json=payload,
+            timeout=120,
+        )
+    session = requests.Session()
+    session.trust_env = False
+    return session.post(
+        "https://openrouter.ai/api/v1/chat/completions",
+        headers=headers,
+        json=payload,
+        timeout=120,
+    )
+
+
 def call_openrouter(content, api_key, model, max_retries, backoff_base, backoff_max):
     if not api_key:
         raise RuntimeError("OPENROUTER_API_KEY is not set.")
@@ -310,16 +335,27 @@ def call_openrouter(content, api_key, model, max_retries, backoff_base, backoff_
         "Content-Type": "application/json",
         "X-Title": "Caseware OCR Runner",
     }
+    trust_env = True
 
     for attempt in range(1, max_retries + 1):
         if RATE_LIMITER:
             RATE_LIMITER.wait()
-        response = requests.post(
-            "https://openrouter.ai/api/v1/chat/completions",
-            headers=headers,
-            json=payload,
-            timeout=120,
-        )
+        try:
+            response = _post_openrouter(payload, headers, trust_env=trust_env)
+        except requests.RequestException as exc:
+            if trust_env and _is_proxy_connection_error(exc):
+                trust_env = False
+                _emit_progress(
+                    "Proxy connection failed. Retrying OpenRouter calls without system proxy.",
+                    level="WARN",
+                )
+                continue
+            if attempt < max_retries:
+                sleep_time = min(backoff_max, backoff_base * (2 ** (attempt - 1)))
+                _emit_progress(f"OpenRouter network error, retrying in {sleep_time:.1f}s", level="WARN")
+                time.sleep(sleep_time)
+                continue
+            raise RuntimeError(f"OpenRouter network error: {exc}") from exc
 
         if response.status_code == 200:
             try:
@@ -1267,6 +1303,8 @@ def process_directory(
         raise RuntimeError("No eligible files found in directory.")
 
     all_rows = []
+    failure_count = 0
+    first_error = ""
     total = len(files)
     for idx, path in enumerate(files, start=1):
         _check_stop(stop_check)
@@ -1294,6 +1332,9 @@ def process_directory(
         except ProcessingStopped:
             raise
         except Exception as exc:
+            failure_count += 1
+            if not first_error:
+                first_error = f"{source_name}: {exc}"
             _emit_progress(f"{source_name} failed: {exc}", current=idx, total=total, level="ERROR")
             continue
         if not rows:
@@ -1302,6 +1343,10 @@ def process_directory(
         all_rows.extend(rows)
 
     if not all_rows:
+        if failure_count == total and first_error:
+            raise RuntimeError(
+                f"No transactions were extracted because all files failed. First error: {first_error}"
+            )
         raise RuntimeError("No transactions were extracted.")
 
     detect_duplicates(all_rows)
